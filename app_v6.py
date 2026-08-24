@@ -31,7 +31,7 @@ st.caption(
     "using projected average points per week."
 )
 
-st.caption("**Build v6 — blank username + balanced trade sizes only**")
+st.caption("**Build v7 — weekly ideal-lineup trade deltas**")
 
 DEFAULT_USERNAME = ""
 PREFERRED_LEAGUE_ID = "1393026126246346752"
@@ -885,8 +885,10 @@ with right:
 
 st.markdown("### Trade search settings")
 st.caption(
-    "Deployment mode: only 1-for-1 and 2-for-2 trades are evaluated as valid "
-    "recommendations. Uneven trades are hidden."
+    "Only 1-for-1 and 2-for-2 trades are evaluated. Lineup Δ / wk is calculated "
+    "from each team's BEST LEGAL STARTING LINEUP independently for every week "
+    "before and after the trade. Bench points only count when that player enters "
+    "that week's ideal lineup."
 )
 a, b, c = st.columns(3)
 with a:
@@ -955,9 +957,9 @@ if st.button(button_text, type="primary"):
                 raw_value_ratio_low=float(ratio_low),
                 raw_value_ratio_high=float(ratio_high),
                 exact_rescore_limit=int(exact_limit),
+            same_size_only=True,
             )
 
-        results = keep_equal_size_trades(results, trade_size_mode)
         results = keep_equal_size_trades(results, trade_size_mode)
         mutual = [r for r in results if r.my_gain > 0 and r.their_gain > 0]
         display_results = mutual if mutual else results[:50]
@@ -1010,8 +1012,10 @@ if st.button(button_text, type="primary"):
                 raw_value_ratio_low=float(ratio_low),
                 raw_value_ratio_high=float(ratio_high),
                 exact_rescore_limit=int(exact_limit),
+            same_size_only=True,
             )
 
+            results = keep_equal_size_trades(results, trade_size_mode)
             mutual = [r for r in results if r.my_gain > 0 and r.their_gain > 0]
             for result in mutual[:50]:
                 row = {

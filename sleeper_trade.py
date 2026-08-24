@@ -507,107 +507,265 @@ def find_trades(
     candidate_pool_size: int = 14,
     raw_value_ratio_low: float = 0.55,
     raw_value_ratio_high: float = 1.80,
-    exact_rescore_limit: int = 250,
+    exact_rescore_limit: int | None = 250,
+    same_size_only: bool = False,
+    screen_week_count: int = 4,
 ) -> list[TradeResult]:
     """
-    Two-stage search:
-      1) Screen every combination using each player's average projected weekly points.
-      2) Re-score the best candidates week-by-week using optimized starting lineups.
+    Find trades using each team's BEST LEGAL STARTERS independently each week.
 
-    This lets positional need create positive-sum trades while keeping 2-for-2
-    searches fast.
+    The displayed lineup delta is never based on total-roster points:
+      Week N gain = optimal starters after trade - optimal starters before trade
+
+    The final value is the average of those weekly gains.
+
+    Bench projections only matter in a week when the optimizer actually places
+    that player into the best legal starting lineup for that week.
+
+    To keep league-wide 2-for-2 searches responsive, candidate trades are first
+    ranked using a few representative weeks. That screening stage ALSO uses
+    weekly optimal starting lineups. Finalists are then evaluated over every
+    projection week.
     """
+
     def top_pool(roster: list[str]) -> list[str]:
-        # Keep highest-projected assets. If roster is smaller than the limit, keep all.
         return sorted(
             list(dict.fromkeys(roster)),
             key=lambda p: avg_ppg.get(p, 0.0),
             reverse=True,
         )[:candidate_pool_size]
 
+    def choose_screen_weeks(weeks: list[int], count: int) -> list[int]:
+        if not weeks:
+            return []
+        if len(weeks) <= count:
+            return list(weeks)
+
+        indexes = np.linspace(
+            0,
+            len(weeks) - 1,
+            num=max(2, int(count)),
+            dtype=int,
+        )
+        return list(dict.fromkeys(weeks[int(i)] for i in indexes))
+
     my_pool = top_pool(my_roster)
     their_pool = top_pool(their_roster)
 
-    my_before_static, _ = optimal_lineup(my_roster, slots, avg_ppg, position_map)
-    their_before_static, _ = optimal_lineup(their_roster, slots, avg_ppg, position_map)
-
-    my_combos = combo_list(my_pool, max_assets_each_side)
-    their_combos = combo_list(their_pool, max_assets_each_side)
-
-    screened = []
-
-    for give in my_combos:
-        sent = sum(avg_ppg.get(p, 0.0) for p in give)
-        for receive in their_combos:
-            received = sum(avg_ppg.get(p, 0.0) for p in receive)
-
-            if sent <= 0 and received <= 0:
-                continue
-            ratio = received / sent if sent > 0 else float("inf")
-            if not (raw_value_ratio_low <= ratio <= raw_value_ratio_high):
-                continue
-
-            new_mine = _apply_trade(my_roster, give, receive)
-            new_theirs = _apply_trade(their_roster, receive, give)
-
-            my_after_static, _ = optimal_lineup(new_mine, slots, avg_ppg, position_map)
-            their_after_static, _ = optimal_lineup(new_theirs, slots, avg_ppg, position_map)
-
-            my_delta = my_after_static - my_before_static
-            their_delta = their_after_static - their_before_static
-
-            # Keep mutual wins plus near-wins for exact rescoring.
-            screen_score = min(my_delta, their_delta) - 0.15 * abs(my_delta - their_delta)
-            screened.append(
-                (
-                    screen_score,
-                    give,
-                    receive,
-                    sent,
-                    received,
-                    new_mine,
-                    new_theirs,
-                )
-            )
-
-    screened.sort(key=lambda x: x[0], reverse=True)
-    screened = screened[:exact_rescore_limit]
+    my_combos_by_size = {
+        n: list(itertools.combinations(my_pool, n))
+        for n in range(1, max_assets_each_side + 1)
+    }
+    their_combos_by_size = {
+        n: list(itertools.combinations(their_pool, n))
+        for n in range(1, max_assets_each_side + 1)
+    }
 
     if projection_weeks:
+        # Compute each team's ideal starting lineup score separately for EVERY week.
         my_week_baseline = {}
         their_week_baseline = {}
+
         for week in projection_weeks:
             pts = weekly_points.get(week, {})
-            my_week_baseline[week] = optimal_lineup(my_roster, slots, pts, position_map)[0]
-            their_week_baseline[week] = optimal_lineup(their_roster, slots, pts, position_map)[0]
+            my_week_baseline[week] = optimal_lineup(
+                my_roster,
+                slots,
+                pts,
+                position_map,
+            )[0]
+            their_week_baseline[week] = optimal_lineup(
+                their_roster,
+                slots,
+                pts,
+                position_map,
+            )[0]
 
         my_before = sum(my_week_baseline.values()) / len(projection_weeks)
         their_before = sum(their_week_baseline.values()) / len(projection_weeks)
+        screen_weeks = choose_screen_weeks(
+            projection_weeks,
+            screen_week_count,
+        )
     else:
-        my_before = my_before_static
-        their_before = their_before_static
+        # Only a fallback when weekly projection data is unavailable.
+        my_before = optimal_lineup(
+            my_roster,
+            slots,
+            avg_ppg,
+            position_map,
+        )[0]
+        their_before = optimal_lineup(
+            their_roster,
+            slots,
+            avg_ppg,
+            position_map,
+        )[0]
+        my_week_baseline = {}
+        their_week_baseline = {}
+        screen_weeks = []
+
+    size_pairs = []
+    for give_size in range(1, max_assets_each_side + 1):
+        for receive_size in range(1, max_assets_each_side + 1):
+            if same_size_only and give_size != receive_size:
+                continue
+            size_pairs.append((give_size, receive_size))
+
+    screened = []
+
+    for give_size, receive_size in size_pairs:
+        for give in my_combos_by_size[give_size]:
+            sent = sum(avg_ppg.get(p, 0.0) for p in give)
+
+            for receive in their_combos_by_size[receive_size]:
+                received = sum(avg_ppg.get(p, 0.0) for p in receive)
+
+                if sent <= 0 and received <= 0:
+                    continue
+
+                ratio = received / sent if sent > 0 else float("inf")
+                if not (raw_value_ratio_low <= ratio <= raw_value_ratio_high):
+                    continue
+
+                new_mine = _apply_trade(my_roster, give, receive)
+                new_theirs = _apply_trade(their_roster, receive, give)
+
+                if screen_weeks:
+                    my_screen_deltas = []
+                    their_screen_deltas = []
+
+                    for week in screen_weeks:
+                        pts = weekly_points.get(week, {})
+
+                        my_after_week = optimal_lineup(
+                            new_mine,
+                            slots,
+                            pts,
+                            position_map,
+                        )[0]
+                        their_after_week = optimal_lineup(
+                            new_theirs,
+                            slots,
+                            pts,
+                            position_map,
+                        )[0]
+
+                        my_screen_deltas.append(
+                            my_after_week - my_week_baseline[week]
+                        )
+                        their_screen_deltas.append(
+                            their_after_week - their_week_baseline[week]
+                        )
+
+                    my_delta = sum(my_screen_deltas) / len(my_screen_deltas)
+                    their_delta = (
+                        sum(their_screen_deltas) / len(their_screen_deltas)
+                    )
+                else:
+                    my_after_static = optimal_lineup(
+                        new_mine,
+                        slots,
+                        avg_ppg,
+                        position_map,
+                    )[0]
+                    their_after_static = optimal_lineup(
+                        new_theirs,
+                        slots,
+                        avg_ppg,
+                        position_map,
+                    )[0]
+                    my_delta = my_after_static - my_before
+                    their_delta = their_after_static - their_before
+
+                screen_score = (
+                    min(my_delta, their_delta)
+                    - 0.15 * abs(my_delta - their_delta)
+                )
+
+                screened.append(
+                    (
+                        screen_score,
+                        give,
+                        receive,
+                        sent,
+                        received,
+                        new_mine,
+                        new_theirs,
+                    )
+                )
+
+    screened.sort(key=lambda x: x[0], reverse=True)
+
+    if exact_rescore_limit is not None:
+        screened = screened[: int(exact_rescore_limit)]
 
     results: list[TradeResult] = []
+
     for _, give, receive, sent, received, new_mine, new_theirs in screened:
         if projection_weeks:
             my_after_scores = []
             their_after_scores = []
+            my_week_deltas = []
+            their_week_deltas = []
+
             for week in projection_weeks:
                 pts = weekly_points.get(week, {})
-                my_after_scores.append(optimal_lineup(new_mine, slots, pts, position_map)[0])
-                their_after_scores.append(optimal_lineup(new_theirs, slots, pts, position_map)[0])
+
+                # Re-optimize the STARTERS for this specific week after the trade.
+                my_after_week = optimal_lineup(
+                    new_mine,
+                    slots,
+                    pts,
+                    position_map,
+                )[0]
+                their_after_week = optimal_lineup(
+                    new_theirs,
+                    slots,
+                    pts,
+                    position_map,
+                )[0]
+
+                my_after_scores.append(my_after_week)
+                their_after_scores.append(their_after_week)
+
+                # This is the actual "Lineup Delta / Week".
+                my_week_deltas.append(
+                    my_after_week - my_week_baseline[week]
+                )
+                their_week_deltas.append(
+                    their_after_week - their_week_baseline[week]
+                )
+
             my_after = sum(my_after_scores) / len(my_after_scores)
             their_after = sum(their_after_scores) / len(their_after_scores)
+
+            # Explicit average of WEEK-BY-WEEK changes.
+            my_gain = sum(my_week_deltas) / len(my_week_deltas)
+            their_gain = sum(their_week_deltas) / len(their_week_deltas)
+
         else:
-            my_after = optimal_lineup(new_mine, slots, avg_ppg, position_map)[0]
-            their_after = optimal_lineup(new_theirs, slots, avg_ppg, position_map)[0]
+            my_after = optimal_lineup(
+                new_mine,
+                slots,
+                avg_ppg,
+                position_map,
+            )[0]
+            their_after = optimal_lineup(
+                new_theirs,
+                slots,
+                avg_ppg,
+                position_map,
+            )[0]
+            my_gain = my_after - my_before
+            their_gain = their_after - their_before
 
         results.append(
             TradeResult(
                 give=give,
                 receive=receive,
-                my_gain=my_after - my_before,
-                their_gain=their_after - their_before,
+                my_gain=my_gain,
+                their_gain=their_gain,
                 my_after=my_after,
                 their_after=their_after,
                 my_before=my_before,
@@ -618,11 +776,14 @@ def find_trades(
         )
 
     results.sort(
-        key=lambda r: (r.mutual_gain, -r.fairness_gap, r.my_gain + r.their_gain),
+        key=lambda r: (
+            r.mutual_gain,
+            -r.fairness_gap,
+            r.my_gain + r.their_gain,
+        ),
         reverse=True,
     )
     return results
-
 
 def trades_to_dataframe(results: list[TradeResult], players: dict) -> pd.DataFrame:
     rows = []
