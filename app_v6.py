@@ -957,7 +957,7 @@ if st.button(button_text, type="primary"):
                 raw_value_ratio_low=float(ratio_low),
                 raw_value_ratio_high=float(ratio_high),
                 exact_rescore_limit=int(exact_limit),
-            same_size_only=True,
+                same_size_only=True,
             )
 
         results = keep_equal_size_trades(results, trade_size_mode)
@@ -1012,7 +1012,7 @@ if st.button(button_text, type="primary"):
                 raw_value_ratio_low=float(ratio_low),
                 raw_value_ratio_high=float(ratio_high),
                 exact_rescore_limit=int(exact_limit),
-            same_size_only=True,
+                same_size_only=True,
             )
 
             results = keep_equal_size_trades(results, trade_size_mode)
